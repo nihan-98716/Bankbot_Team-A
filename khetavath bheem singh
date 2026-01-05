@@ -1,0 +1,275 @@
+import os
+import json
+import time
+import re
+import streamlit as st
+import requests
+
+# =================== CONFIG ===================
+OLLAMA_URL = "http://localhost:11434/api/chat"
+MODEL_NAME = "llama3.2"
+CHAT_STORE_FILE = "chats_data.json"
+
+# =================== FAQS ===================
+FAQ_QUESTIONS = [
+    "What is a savings account?",
+    "What is a current account?",
+    "What is a fixed deposit?",
+    "What is EMI and how is it calculated?",
+    "What is CIBIL score?",
+    "Difference between NEFT, RTGS and IMPS?",
+]
+
+# =================== BANKING KEYWORDS ===================
+BANKING_KEYWORDS = [
+    "bank", "banking", "account", "savings", "current account",
+    "deposit", "fixed deposit", "fd", "rd",
+    "loan", "personal loan", "home loan", "education loan",
+    "emi", "interest", "interest rate",
+    "credit card", "debit card", "atm",
+    "upi", "neft", "rtgs", "imps",
+    "cibil", "credit score",
+    "kyc", "pan", "aadhaar",
+    "statement", "passbook",
+    "charges", "processing fee",
+    "overdraft", "prepayment", "foreclosure"
+]
+
+# =================== STRICT CHECK ===================
+def is_banking_related(text: str) -> bool:
+    text = text.lower()
+    for kw in BANKING_KEYWORDS:
+        if re.search(rf"\b{re.escape(kw)}\b", text):
+            return True
+    return False
+
+# =================== OLLAMA CALL ===================
+def call_ollama(user_message: str) -> str:
+    system_prompt = (
+        "You are a banking assistant. "
+        "Answer ONLY banking-related questions. "
+        "Do not answer anything outside banking. "
+        "End with: 'This is general information and not financial advice.'"
+    )
+
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+        "stream": False,
+    }
+
+    try:
+        r = requests.post(OLLAMA_URL, json=payload, timeout=120)
+        r.raise_for_status()
+        return r.json()["message"]["content"]
+    except Exception as e:
+        return f"Error talking to Ollama: {e}"
+
+# =================== TITLE GENERATOR ===================
+def generate_chat_title(text: str) -> str:
+    remove = [
+        "what is", "what are", "explain", "define",
+        "how to", "how is", "difference between",
+        "tell me about", "can you explain"
+    ]
+    t = text.lower()
+    for r in remove:
+        t = t.replace(r, "")
+    t = t.strip().capitalize()
+    return t[:35] + "..." if len(t) > 35 else t
+
+# =================== PERSISTENCE ===================
+def load_chats():
+    if not os.path.exists(CHAT_STORE_FILE):
+        return None
+
+    with open(CHAT_STORE_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    chats = {int(k): v for k, v in data["chats"].items()}
+
+    for chat in chats.values():
+        chat.setdefault("name", "New Chat")
+        chat.setdefault("messages", [])
+        chat.setdefault("last_accessed", time.time())
+
+    return {
+        "chats": chats,
+        "active_chat_id": data.get("active_chat_id"),
+        "next_chat_id": data.get("next_chat_id", 1),
+    }
+
+def save_chats():
+    with open(CHAT_STORE_FILE, "w", encoding="utf-8") as f:
+        json.dump({
+            "chats": {str(k): v for k, v in st.session_state.chats.items()},
+            "active_chat_id": st.session_state.active_chat_id,
+            "next_chat_id": st.session_state.next_chat_id,
+        }, f, indent=2)
+
+# =================== SESSION ===================
+def init_session():
+    if "loaded" not in st.session_state:
+        data = load_chats()
+        if data:
+            st.session_state.chats = data["chats"]
+            st.session_state.active_chat_id = data["active_chat_id"]
+            st.session_state.next_chat_id = data["next_chat_id"]
+        else:
+            st.session_state.chats = {}
+            st.session_state.active_chat_id = None
+            st.session_state.next_chat_id = 1
+        st.session_state.loaded = True
+
+    if not st.session_state.chats:
+        create_new_chat()
+
+def create_new_chat():
+    cid = st.session_state.next_chat_id
+    st.session_state.next_chat_id += 1
+    st.session_state.chats[cid] = {
+        "name": "New Chat",
+        "messages": [],
+        "last_accessed": time.time()
+    }
+    st.session_state.active_chat_id = cid
+    save_chats()
+
+def get_active_chat():
+    return st.session_state.chats[st.session_state.active_chat_id]
+
+def update_access(cid):
+    st.session_state.chats[cid]["last_accessed"] = time.time()
+
+def delete_chat(cid):
+    st.session_state.chats.pop(cid)
+    if not st.session_state.chats:
+        create_new_chat()
+    else:
+        st.session_state.active_chat_id = max(
+            st.session_state.chats,
+            key=lambda k: st.session_state.chats[k]["last_accessed"]
+        )
+    save_chats()
+    st.rerun()
+
+# =================== MESSAGE HANDLER ===================
+def send_message(question, chat):
+    if chat["name"] == "New Chat":
+        chat["name"] = generate_chat_title(question)
+
+    chat["messages"].append({"role": "user", "content": question})
+
+    if not is_banking_related(question):
+        chat["messages"].append({
+            "role": "assistant",
+            "content": (
+                "⚠️ I can answer **only banking-related questions**.\n\n"
+                "Please ask about:\n"
+                "- Bank accounts\n"
+                "- Loans & EMI\n"
+                "- Deposits\n"
+                "- NEFT / RTGS / IMPS\n\n"
+                "This is general information and not financial advice."
+            )
+        })
+        save_chats()
+        return
+
+    chat["messages"].append({
+        "role": "assistant",
+        "content": call_ollama(question)
+    })
+
+    chat["last_accessed"] = time.time()
+    save_chats()
+
+# =================== MAIN APP ===================
+def main():
+    st.set_page_config("Bank Bot", "🏦", "wide")
+
+    # 🎨 THEME (ONLY INPUT CSS CHANGED)
+    st.markdown("""
+    <style>
+    .stApp { background-color: #F5F7FA; }
+    section[data-testid="stSidebar"] { background-color: #E3F2FD; }
+    .user-msg { background-color: #DCF8C6; }
+    .bot-msg { background-color: #FFFFFF; }
+
+    .input-container {
+        position: sticky;
+        bottom: 0;
+        background: #F5F7FA;
+        padding: 12px 16px;
+        border-top: 1px solid #ddd;
+        z-index: 100;
+    }
+
+    .input-inner {
+        max-width: 1100px;
+        margin: auto;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    init_session()
+    chat = get_active_chat()
+
+    # Sidebar
+    with st.sidebar:
+        st.title("💬 Chats")
+        if st.button("➕ New Chat"):
+            create_new_chat()
+
+        st.markdown("---")
+        for cid, c in sorted(
+            st.session_state.chats.items(),
+            key=lambda x: x[1]["last_accessed"],
+            reverse=True
+        ):
+            col1, col2 = st.columns([4, 1])
+            with col1:
+                if st.button(c["name"], key=f"open_{cid}"):
+                    st.session_state.active_chat_id = cid
+                    update_access(cid)
+                    save_chats()
+            with col2:
+                if st.button("🗑", key=f"del_{cid}"):
+                    delete_chat(cid)
+
+    # Chat UI
+    st.title("🏦 Bank Bot")
+    st.info("⚠️ This bot answers **only banking-related questions**.")
+
+    for msg in chat["messages"]:
+        css = "user-msg" if msg["role"] == "user" else "bot-msg"
+        align = "right" if msg["role"] == "user" else "left"
+        st.markdown(
+            f"<div class='{css}' style='text-align:{align}; "
+            f"padding:10px; border-radius:8px; margin:6px;'>"
+            f"{msg['content']}</div>",
+            unsafe_allow_html=True
+        )
+
+    # FAQs
+    st.markdown("---")
+    st.subheader("❓ Banking FAQs")
+    for q in FAQ_QUESTIONS:
+        if st.button(q):
+            send_message(q, chat)
+            st.rerun()
+
+    # Sticky Input (ONLY UI CHANGE)
+    st.markdown("<div class='input-container'><div class='input-inner'>", unsafe_allow_html=True)
+    with st.form("chat_form", clear_on_submit=True):
+        q = st.text_input("Ask a banking question…")
+        if st.form_submit_button("Send") and q.strip():
+            send_message(q, chat)
+            st.rerun()
+    st.markdown("</div></div>", unsafe_allow_html=True)
+
+if __name__ == "__main__":
+    main()
